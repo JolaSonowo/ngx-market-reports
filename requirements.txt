@@ -1,0 +1,6 @@
+streamlit
+pandas
+xlsxwriter
+python-docx
+lxml
+pytz
