@@ -4,31 +4,43 @@ import requests
 import io
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 # --- 1. TIME & DATE LOGIC ---
 def get_lagos_time():
     return datetime.now(pytz.timezone('Africa/Lagos'))
 
-def get_ordinal_date():
-    now = get_lagos_time()
-    day = now.day
+def format_ordinal(dt):
+    day = dt.day
     suffix = "TH" if 11 <= day <= 13 else {1: "ST", 2: "ND", 3: "RD"}.get(day % 10, "TH")
-    return now.strftime(f"{day}{suffix} %b %Y").upper()
+    return dt.strftime(f"{day}{suffix} %b %Y").upper()
 
-def is_report_available():
+def get_report_date_info():
     now = get_lagos_time()
-
-    if now.weekday() > 4:
-        return False, "The market is closed for the weekend."
+    day_of_week = now.weekday() # 0=Mon, 5=Sat, 6=Sun
     
-
-    report_time = now.replace(hour=14, minute=40, second=0, microsecond=0)
-    if now < report_time:
-        return False, f"The report will be available at 2:40 PM. Current time: {now.strftime('%I:%M %p')}"
+    # Define 2:40 PM today
+    today_cutoff = now.replace(hour=14, minute=40, second=0, microsecond=0)
     
-    return True, "Report is ready for download!"
+    # Logic for which date the report represents
+    if day_of_week == 5: # Saturday
+        report_date = now - timedelta(days=1) # Friday
+        status = "Weekend Mode: Showing Friday's Closing Summary"
+    elif day_of_week == 6: # Sunday
+        report_date = now - timedelta(days=2) # Friday
+        status = "Weekend Mode: Showing Friday's Closing Summary"
+    elif now < today_cutoff:
+        # Before 2:40 PM on a weekday, show previous trading day
+        days_to_subtract = 3 if day_of_week == 0 else 1
+        report_date = now - timedelta(days=days_to_subtract)
+        status = f"Market Open: Showing Summary for {format_ordinal(report_date)}"
+    else:
+        # After 2:40 PM on a weekday
+        report_date = now
+        status = "Market Closed: Today's Summary is Ready"
+        
+    return report_date, status
 
 # --- 2. DATA FETCHING ---
 @st.cache_data(ttl=600)
@@ -41,10 +53,11 @@ def fetch_ngx_data():
     }
     try:
         response = session.get(url, headers=headers, timeout=15)
+        # We read the table and force the headers you need
         tables = pd.read_html(io.StringIO(response.text))
         df = tables[0]
         
-
+        # Rename columns based on your NGX observation
         df = df.rename(columns={
             'Symbol': 'Ticker', 
             'Current': 'Close Price', 
@@ -52,6 +65,7 @@ def fetch_ngx_data():
             '% Change': '% Change'
         }, errors='ignore')
 
+        # Clean numeric data
         for col in ['% Change', 'Close Price', 'Naira Change']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
@@ -61,21 +75,21 @@ def fetch_ngx_data():
     except:
         return None, None
 
-# --- 3. FILE GENERATORS (EXCEL & WORD) ---
-def create_excel(adv, dec):
+# --- 3. FILE GENERATORS ---
+def create_excel(adv, dec, date_str):
     output = io.BytesIO()
-    date_header = get_ordinal_date()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         adv.rename(columns={'Ticker': 'Gainers'}).to_excel(writer, sheet_name='Summary', startrow=2, index=False)
         dec.rename(columns={'Ticker': 'Decliners'}).to_excel(writer, sheet_name='Summary', startrow=10, index=False)
         worksheet = writer.sheets['Summary']
-        title_fmt = writer.book.add_format({'bold': True, 'align': 'center', 'font_size': 14})
-        worksheet.merge_range('A1:D1', f"DAILY EQUITY SUMMARY FOR {date_header}", title_fmt)
+        workbook = writer.book
+        title_fmt = workbook.add_format({'bold': True, 'align': 'center', 'font_size': 14})
+        worksheet.merge_range('A1:D1', f"DAILY EQUITY SUMMARY FOR {date_str}", title_fmt)
     return output.getvalue()
 
-def create_word(adv, dec):
+def create_word(adv, dec, date_str):
     doc = Document()
-    title = doc.add_heading(f"DAILY EQUITY SUMMARY FOR {get_ordinal_date()}", level=1)
+    title = doc.add_heading(f"DAILY EQUITY SUMMARY FOR {date_str}", level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     for df, label in [(adv, "Gainers"), (dec, "Decliners")]:
         doc.add_heading(label, level=2)
@@ -96,18 +110,28 @@ def create_word(adv, dec):
 st.set_page_config(page_title="NGX Reporter", page_icon="📈")
 st.title("NGX Daily Market Reporter")
 
-available, message = is_report_available()
+report_date, status_msg = get_report_date_info()
+date_display = format_ordinal(report_date)
 
-if not available:
-    st.warning(f"{message}")
-    st.info("Please check back after 2:40 PM Lagos time.")
-else:
-    st.success(f"{message}")
-    if st.button("Fetch and Prepare Documents"):
+st.info(f"**Report Date:** {date_display}")
+st.write(f"{status_msg}")
+
+if st.button("Generate Reports"):
+    with st.spinner("Fetching live data..."):
         adv, dec = fetch_ngx_data()
-        if adv is not None:
-            filename = f"DAILY EQUITY SUMMARY FOR {get_ordinal_date()}"
-            st.download_button("Download Excel Report", create_excel(adv, dec), f"{filename}.xlsx")
-            st.download_button("Download Word Report", create_word(adv, dec), f"{filename}.docx")
-        else:
-            st.error("Could not reach NGX. Please refresh.")
+        
+    if adv is not None:
+        filename = f"DAILY EQUITY SUMMARY FOR {date_display}"
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("Excel Format", create_excel(adv, dec, date_display), f"{filename}.xlsx")
+        with col2:
+            st.download_button("Word Format", create_word(adv, dec, date_display), f"{filename}.docx")
+        
+        st.divider()
+        st.subheader("Preview")
+        st.write("**Top 5 Gainers**")
+        st.dataframe(adv, hide_index=True)
+    else:
+        st.error("Could not connect to NGX. Please check your internet or try again.")
