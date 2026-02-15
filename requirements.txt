@@ -1,6 +1,7 @@
 streamlit
 pandas
-requests
+selenium
+webdriver-manager
 xlsxwriter
 python-docx
 lxml
