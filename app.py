@@ -19,11 +19,11 @@ def get_ordinal_date():
 
 def is_report_available():
     now = get_lagos_time()
-    # Check if it's a weekday (0=Monday, 4=Friday)
+
     if now.weekday() > 4:
         return False, "The market is closed for the weekend."
     
-    # Check if current time is after 2:40 PM (14:40)
+
     report_time = now.replace(hour=14, minute=40, second=0, microsecond=0)
     if now < report_time:
         return False, f"The report will be available at 2:40 PM. Current time: {now.strftime('%I:%M %p')}"
@@ -44,7 +44,7 @@ def fetch_ngx_data():
         tables = pd.read_html(io.StringIO(response.text))
         df = tables[0]
         
-        # Mapping the specific headers you provided
+
         df = df.rename(columns={
             'Symbol': 'Ticker', 
             'Current': 'Close Price', 
