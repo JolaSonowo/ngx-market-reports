@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import requests
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -7,7 +8,7 @@ import io
 from datetime import datetime
 import pytz
 
-# --- 1. DATE FORMATTING (e.g., 10TH FEB 2026) ---
+# --- 1. DATE FORMATTING ---
 def get_ordinal_date():
     lagos_tz = pytz.timezone('Africa/Lagos')
     now = datetime.now(lagos_tz)
@@ -18,18 +19,33 @@ def get_ordinal_date():
         suffix = {1: "ST", 2: "ND", 3: "RD"}.get(day % 10, "TH")
     return now.strftime(f"{day}{suffix} %b %Y").upper()
 
-# --- 2. DATA FETCHING ---
+# --- 2. UPDATED DATA FETCHING (Using Requests to avoid HTTPError) ---
 @st.cache_data(ttl=3600)
 def fetch_ngx_data():
     url = "https://www.investing.com/equities/nigeria"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    tables = pd.read_html(url, storage_options={'User-Agent': 'Mozilla/5.0'})
+    # Stronger headers to "pretend" we are a real Chrome browser
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/"
+    }
+    
+    # 1. Get the page content using requests
+    response = requests.get(url, headers=headers, timeout=10)
+    
+    # Check if the request was successful
+    if response.status_code != 200:
+        st.error(f"Failed to fetch data. Error code: {response.status_code}")
+        return None, None
+
+    # 2. Use pandas to read the tables from the downloaded HTML text
+    tables = pd.read_html(io.StringIO(response.text))
     df = tables[0]
     
     # Cleaning data for your exact headers
-    df['Close Price'] = df['Last'].astype(float)
+    df['Close Price'] = pd.to_numeric(df['Last'], errors='coerce')
     df['% Change'] = df['Chg. %'].str.replace('%', '').astype(float)
-    df['Naira Change'] = df['Chg'].astype(float)
+    df['Naira Change'] = pd.to_numeric(df['Chg'], errors='coerce')
     
     adv = df.nlargest(5, '% Change')[['Symbol', '% Change', 'Close Price', 'Naira Change']]
     dec = df.nsmallest(5, '% Change')[['Symbol', '% Change', 'Close Price', 'Naira Change']]
@@ -78,15 +94,17 @@ def create_word(adv, dec):
 
 # --- 5. UI ---
 st.set_page_config(page_title="NGX Reporter", page_icon="📈")
-st.title("🇳🇬 NGX Daily Market Reporter")
+st.title("NGX Daily Market Reporter")
 st.write(f"Today is: **{get_ordinal_date()}**")
 
 if st.button("Generate Today's Market Summary"):
-    adv, dec = fetch_ngx_data()
-    filename_base = f"DAILY EQUITY SUMMARY FOR {get_ordinal_date()}"
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button("📥 Download Excel", create_excel(adv, dec), f"{filename_base}.xlsx")
-    with col2:
-        st.download_button("📥 Download Word", create_word(adv, dec), f"{filename_base}.docx")
+    with st.spinner("Fetching data from NGX..."):
+        adv, dec = fetch_ngx_data()
+        
+    if adv is not None:
+        filename_base = f"DAILY EQUITY SUMMARY FOR {get_ordinal_date()}"
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("Download Excel", create_excel(adv, dec), f"{filename_base}.xlsx")
+        with col2:
+            st.download_button("Download Word", create_word(adv, dec), f"{filename_base}.docx")
