@@ -1,8 +1,6 @@
 streamlit
 pandas
-selenium
-webdriver-manager
-xlsxwriter
+requests
 python-docx
-lxml
+xlsxwriter
 pytz
