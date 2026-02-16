@@ -1,8 +1,6 @@
 streamlit
 pandas
-selenium
-selenium-stealth
+requests
 xlsxwriter
 python-docx
-lxml
 pytz
