@@ -20,43 +20,43 @@ def get_market_date():
     elif weekday == 6: # Sunday -> Show Friday
         report_date = now - timedelta(days=2)
     elif current_time < cutoff_time:
-        if weekday == 0: # Monday morning -> Friday
+        if weekday == 0: # Monday morning -> Show Friday
             report_date = now - timedelta(days=3)
-        else: # Weekday morning -> Yesterday
+        else: # Weekday morning -> Show Yesterday
             report_date = now - timedelta(days=1)
-    else: # Weekday afternoon -> Today
+    else: # Weekday after 2:40 PM -> Show Today
         report_date = now
         
     return report_date.strftime("%d %B %Y").upper()
 
-# --- 2. LIGHTWEIGHT DATA FETCHING (No Chrome Needed) ---
+# --- 2. DIRECT DATA FETCHING (Firewall-Safe & Fast) ---
 def fetch_ngx_data():
-    # We use a reliable mirror that is much faster than the official NGX site
-    url = "https://afx.kwayisi.org/ngx/"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # Direct API used by NGX for their document library statistics
+    url = "https://doclib.ngxgroup.com/REST/api/statistics/equities/?market=&sector=&orderby=&pageSize=300&pageNo=0"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
     
     try:
-        # Fetch tables from the page
-        response = requests.get(url, headers=headers, timeout=10)
-        df_list = pd.read_html(io.StringIO(response.text))
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
         
-        # The main price table is usually the first one
-        df = df_list[0]
-
-        # Rename columns to match your requirements
-        # Kwayisi format: Ticker, Name, Price, Change, Gain (%)
-        # We hunt for the columns by keyword to be safe
-        ticker_col = [c for c in df.columns if 'Ticker' in str(c)][0]
-        price_col = [c for c in df.columns if 'Price' in str(c)][0]
-        gain_col = [c for c in df.columns if 'Gain' in str(c) or '%' in str(c)][0]
-        change_col = [c for c in df.columns if 'Change' in str(c)][0]
-
-        df = df[[ticker_col, gain_col, price_col, change_col]]
+        # Create DataFrame from JSON
+        df = pd.DataFrame(data)
+        
+        # Map the internal API keys to your required names
+        # 'symbol' -> Ticker
+        # 'close' -> Close Price
+        # 'changePercentage' -> % Change
+        # 'change' -> Naira Change
+        df = df[['symbol', 'changePercentage', 'close', 'change']].copy()
         df.columns = ['Ticker', '% Change', 'Close Price', 'Naira Change']
 
-        # Convert to numeric
+        # Ensure columns are numeric for sorting
         for col in ['% Change', 'Close Price', 'Naira Change']:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '').str.replace(',', '').str.replace('+', '').strip(), errors='coerce')
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df = df.dropna(subset=['% Change'])
         
@@ -66,10 +66,10 @@ def fetch_ngx_data():
         
         return adv, dec
     except Exception as e:
-        st.error(f"Fetch failed: {e}")
+        st.error(f"⚠️ NGX Feed unavailable: {e}")
         return None, None
 
-# --- 3. EXPORTS ---
+# --- 3. EXPORT GENERATION ---
 def create_excel(adv, dec, date_str):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -87,34 +87,43 @@ def create_word(adv, dec, date_str):
     doc.add_heading(f"DAILY EQUITY SUMMARY FOR {date_str}", 1).alignment = WD_ALIGN_PARAGRAPH.CENTER
     for df, label in [(adv, "Top 5 Advancers"), (dec, "Top 5 Decliners")]:
         doc.add_heading(label, 2)
-        table = doc.add_table(rows=1, cols=4); table.style = 'Table Grid'
+        table = doc.add_table(rows=1, cols=4)
+        table.style = 'Table Grid'
         hdrs = ["Ticker", "% Change", "Close Price", "Naira Change"]
-        for i, h in enumerate(hdrs): table.rows[0].cells[i].text = h
+        for i, h in enumerate(hdrs):
+            table.rows[0].cells[i].text = h
         for _, row in df.iterrows():
             c = table.add_row().cells
-            c[0].text, c[1].text = str(row['Ticker']), f"{row['% Change']:.2f}%"
-            c[2].text, c[3].text = f"{row['Close Price']:.2f}", f"{row['Naira Change']:.2f}"
+            c[0].text = str(row['Ticker'])
+            c[1].text = f"{row['% Change']:.2f}%"
+            c[2].text = f"{row['Close Price']:.2f}"
+            c[3].text = f"{row['Naira Change']:.2f}"
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
 
-# --- 4. UI ---
+# --- 4. STREAMLIT INTERFACE ---
 st.set_page_config(page_title="NGX Reporter", page_icon="🇳🇬")
 st.title("🇳🇬 NGX Market Reporter")
 
 market_date = get_market_date()
-st.info(f"Report for: **{market_date}**")
+st.info(f"Generating data for: **{market_date}**")
 
-if st.button("🚀 Get Data Now"):
-    with st.spinner("Fetching live market summary..."):
+if st.button("🚀 Fetch Top 5 Advancers & Decliners"):
+    with st.spinner("Connecting to NGX Data Feed..."):
         adv, dec = fetch_ngx_data()
-        if adv is not None:
-            st.success("Data ready!")
+        
+        if adv is not None and not adv.empty:
+            st.success("Market Data Captured!")
+            
             c1, c2 = st.columns(2)
-            c1.download_button("📊 Excel", create_excel(adv, dec, market_date), f"NGX_{market_date}.xlsx")
-            c2.download_button("📝 Word", create_word(adv, dec, market_date), f"NGX_{market_date}.docx")
+            c1.download_button("📊 Excel Report", create_excel(adv, dec, market_date), f"NGX_Summary_{market_date}.xlsx")
+            c2.download_button("📝 Word Report", create_word(adv, dec, market_date), f"NGX_Summary_{market_date}.docx")
             
             st.subheader("🟢 Top 5 Advancers")
-            st.dataframe(adv, hide_index=True)
+            st.table(adv[['Ticker', '% Change', 'Close Price', 'Naira Change']])
+            
             st.subheader("🔴 Top 5 Decliners")
-            st.dataframe(dec, hide_index=True)
+            st.table(dec[['Ticker', '% Change', 'Close Price', 'Naira Change']])
+        else:
+            st.warning("Data currently unavailable. This usually happens if the NGX servers are undergoing daily maintenance. Please try again in 10 minutes.")
