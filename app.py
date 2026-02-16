@@ -1,72 +1,85 @@
 import streamlit as st
 import pandas as pd
-import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import io
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from datetime import datetime, time, timedelta
 import pytz
 
-# --- 1. DATE LOGIC (Lagos Time, 2:40 PM Cutoff) ---
+# --- DATE LOGIC ---
 def get_market_date():
     lagos_tz = pytz.timezone('Africa/Lagos')
     now = datetime.now(lagos_tz)
-    weekday = now.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+    weekday = now.weekday() 
     current_time = now.time()
-    cutoff_time = time(14, 40) # 2:40 PM
+    cutoff_time = time(14, 40) 
 
-    if weekday == 5: # Saturday
-        report_date = now - timedelta(days=1)
-    elif weekday == 6: # Sunday
-        report_date = now - timedelta(days=2)
+    if weekday == 5: report_date = now - timedelta(days=1)
+    elif weekday == 6: report_date = now - timedelta(days=2)
     elif current_time < cutoff_time:
-        if weekday == 0: # Monday before 2:40 PM
-            report_date = now - timedelta(days=3)
-        else: # Weekday before 2:40 PM
-            report_date = now - timedelta(days=1)
-    else: # After 2:40 PM
-        report_date = now
-        
+        report_date = now - timedelta(days=3 if weekday == 0 else 1)
+    else: report_date = now
     return report_date.strftime("%d %B %Y").upper()
 
-# --- 2. DATA EXTRACTION (Browser-less) ---
-def fetch_ngx_data():
-    # NGX uses this AJAX endpoint to load their tables without a browser
-    url = "https://ngxgroup.com/wp-admin/admin-ajax.php?action=get_wdtable&table_id=2"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+# --- THE "STREAMLIT CLOUD" DRIVER ---
+def get_driver():
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     
+    # Bypassing Firewall: Use a very common real-world User-Agent
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+    
+    # CRITICAL: These paths are where Streamlit Cloud installs Chromium via packages.txt
+    options.binary_location = "/usr/bin/chromium"
+    service = Service("/usr/bin/chromedriver")
+    
+    return webdriver.Chrome(service=service, options=options)
+
+def fetch_ngx_data():
+    driver = None
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        json_data = response.json()
+        driver = get_driver()
+        # Visit the main site first to establish a "human" session cookie
+        driver.get("https://ngxgroup.com/")
         
-        # Load into DataFrame
-        df = pd.DataFrame(json_data['data'])
+        wait = WebDriverWait(driver, 25)
+        # Find and click the 'Price List' tab (Tab 2)
+        tab = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a[href='#tab2']")))
+        driver.execute_script("arguments[0].click();", tab)
         
-        # Select and rename relevant columns
-        # Based on NGX's internal JSON structure: symbol, current, pchange, change
-        df = df[['symbol', 'pchange', 'current', 'change']].copy()
-        df.columns = ['Ticker', '% Change', 'Close Price', 'Naira Change']
-
-        # Convert strings to numbers
+        # Wait for the specific data table to appear
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.wpDataTable")))
+        
+        df_list = pd.read_html(io.StringIO(driver.page_source))
+        df = df_list[0]
+        
+        # Rename and Clean
+        df = df.rename(columns={'Symbol': 'Ticker', 'Current': 'Close Price', 'Change': 'Naira Change'})
         for col in ['% Change', 'Close Price', 'Naira Change']:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '').str.replace(',', '').str.strip(), errors='coerce')
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '').str.replace(',', '').strip(), errors='coerce')
 
-        # Drop any rows with missing data
         df = df.dropna(subset=['% Change'])
-
-        # Get Top 5 Advancers and Decliners
         adv = df.sort_values(by='% Change', ascending=False).head(5)
         dec = df.sort_values(by='% Change', ascending=True).head(5)
-        
         return adv, dec
     except Exception as e:
-        st.error(f"Failed to fetch data: {e}")
+        st.error(f"Error fetching data: {e}")
         return None, None
+    finally:
+        if driver: driver.quit()
 
-# --- 3. EXPORT GENERATORS ---
+# --- FILE GENERATORS ---
 def create_excel(adv, dec, date_str):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -82,45 +95,34 @@ def create_excel(adv, dec, date_str):
 def create_word(adv, dec, date_str):
     doc = Document()
     doc.add_heading(f"DAILY EQUITY SUMMARY FOR {date_str}", 1).alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
     for df, label in [(adv, "Top 5 Advancers"), (dec, "Top 5 Decliners")]:
         doc.add_heading(label, 2)
-        table = doc.add_table(rows=1, cols=4)
-        table.style = 'Table Grid'
-        hdrs = table.rows[0].cells
-        hdrs[0].text, hdrs[1].text, hdrs[2].text, hdrs[3].text = "Ticker", "% Change", "Close Price", "Naira Change"
-        
+        table = doc.add_table(rows=1, cols=4); table.style = 'Table Grid'
+        for i, h in enumerate([label, "% Change", "Close Price", "Naira Change"]):
+            table.rows[0].cells[i].text = h
         for _, row in df.iterrows():
-            row_cells = table.add_row().cells
-            row_cells[0].text = str(row['Ticker'])
-            row_cells[1].text = f"{row['% Change']:.2f}%"
-            row_cells[2].text = f"{row['Close Price']:.2f}"
-            row_cells[3].text = f"{row['Naira Change']:.2f}"
-            
+            c = table.add_row().cells
+            c[0].text, c[1].text = str(row['Ticker']), f"{row['% Change']:.2f}%"
+            c[2].text, c[3].text = f"{row['Close Price']:.2f}", f"{row['Naira Change']:.2f}"
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
 
-# --- 4. STREAMLIT UI ---
-st.set_page_config(page_title="NGX Reporter", page_icon="🇳🇬")
-st.title("📈 NGX Market Data Extractor")
-
+# --- UI ---
+st.set_page_config(page_title="NGX Reporter")
+st.title("🇳🇬 NGX Market Reporter")
 market_date = get_market_date()
-st.info(f"Generating data for: **{market_date}**")
+st.info(f"Report Date: **{market_date}**")
 
-if st.button("🚀 Fetch NGX Figures"):
-    with st.spinner("Connecting to NGX..."):
+if st.button("🚀 Generate Reports"):
+    with st.spinner("Accessing NGX website..."):
         adv, dec = fetch_ngx_data()
-        
         if adv is not None:
-            st.success("Data loaded successfully!")
-            
-            c1, c2 = st.columns(2)
-            c1.download_button("📊 Download Excel", create_excel(adv, dec, market_date), f"NGX_Summary_{market_date}.xlsx")
-            c2.download_button("📝 Download Word", create_word(adv, dec, market_date), f"NGX_Summary_{market_date}.docx")
-            
+            st.success("Data Captured Successfully!")
+            col1, col2 = st.columns(2)
+            col1.download_button("📊 Excel", create_excel(adv, dec, market_date), f"NGX_{market_date}.xlsx")
+            col2.download_button("📝 Word", create_word(adv, dec, market_date), f"NGX_{market_date}.docx")
             st.subheader("Top 5 Advancers")
-            st.dataframe(adv, use_container_width=True)
-            
+            st.table(adv[['Ticker', '% Change', 'Close Price', 'Naira Change']])
             st.subheader("Top 5 Decliners")
-            st.dataframe(dec, use_container_width=True)
+            st.table(dec[['Ticker', '% Change', 'Close Price', 'Naira Change']])
