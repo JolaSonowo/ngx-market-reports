@@ -14,6 +14,7 @@ def get_market_date():
     weekday = now.weekday() 
     cutoff_time = time(14, 40) # 2:40 PM
 
+    # Weekend or before 2:40 PM logic
     if weekday == 5: # Saturday
         report_date = now - timedelta(days=1)
     elif weekday == 6: # Sunday
@@ -26,64 +27,73 @@ def get_market_date():
         
     return report_date.strftime("%d %B %Y").upper()
 
-# --- 2. ROBUST DATA FETCHING ---
+# --- 2. FUZZY COLUMN FINDER ---
+def find_column(df, keywords):
+    """Finds a column name in df that matches any of the keywords."""
+    for col in df.columns:
+        if any(key.lower() in str(col).lower() for key in keywords):
+            return col
+    return None
+
+# --- 3. ROBUST DATA FETCHING ---
 def fetch_ngx_data():
-    # Attempt 1: Official NGX Data API
-    url = "https://doclib.ngxgroup.com/REST/api/statistics/equities/?market=&sector=&orderby=&pageSize=300&pageNo=0"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            df = pd.DataFrame(response.json())
-            # Map API keys to our standard names
-            column_map = {
-                'symbol': 'Ticker',
-                'close': 'Close Price',
-                'changePercentage': '% Change',
-                'change': 'Naira Change'
-            }
-            df = df.rename(columns=column_map)
-        else:
-            # Attempt 2: Stable Fallback Source (Kwayisi)
-            df = pd.read_html("https://afx.kwayisi.org/ngx/")[0]
-            # Standardize fallback names
-            df = df.rename(columns={'Price': 'Close Price', 'Gain': '% Change', 'Change': 'Naira Change'})
+    # Sources: Official API, then secondary mirror
+    sources = [
+        "https://doclib.ngxgroup.com/REST/api/statistics/equities/?market=&sector=&orderby=&pageSize=300&pageNo=0",
+        "https://afx.kwayisi.org/ngx/"
+    ]
+    
+    for url in sources:
+        try:
+            if "json" in url or "doclib" in url:
+                resp = requests.get(url, headers=headers, timeout=15)
+                df = pd.DataFrame(resp.json())
+            else:
+                df = pd.read_html(url)[0]
 
-        # --- SMART COLUMN CLEANING ---
-        # Find the % Change column even if renamed (look for 'Gain' or '%')
-        potential_pct_cols = [c for c in df.columns if '%' in c or 'Gain' in str(c) or 'pchange' in str(c).lower()]
-        if potential_pct_cols:
-            df = df.rename(columns={potential_pct_cols[0]: '% Change'})
+            if df.empty: continue
 
-        # Clean numeric data
-        for col in ['% Change', 'Close Price', 'Naira Change']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '').str.replace(',', '').str.strip(), errors='coerce')
+            # Robust Column Mapping
+            ticker_col = find_column(df, ['symbol', 'ticker', 'company', 'name'])
+            price_col = find_column(df, ['close', 'price', 'current'])
+            pct_col = find_column(df, ['%', 'gain', 'pchange', 'changepercentage'])
+            naira_col = find_column(df, ['naira', 'change', 'absolute'])
 
-        df = df.dropna(subset=['% Change'])
-        
-        # Get Top 5
-        adv = df.sort_values(by='% Change', ascending=False).head(5)
-        dec = df.sort_values(by='% Change', ascending=True).head(5)
-        
-        return adv, dec
+            # Rename columns to standard format
+            mapping = {}
+            if ticker_col: mapping[ticker_col] = 'Ticker'
+            if price_col: mapping[price_col] = 'Close Price'
+            if pct_col: mapping[pct_col] = '% Change'
+            if naira_col: mapping[naira_col] = 'Naira Change'
+            
+            df = df.rename(columns=mapping)
 
-    except Exception as e:
-        st.error(f"⚠️ Connection Error: {e}")
-        return None, None
+            # Keep only the columns we need
+            df = df[['Ticker', '% Change', 'Close Price', 'Naira Change']]
 
-# --- 3. EXPORT LOGIC ---
+            # Convert to numeric
+            for col in ['% Change', 'Close Price', 'Naira Change']:
+                df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '').str.replace(',', '').str.replace('+', '').str.strip(), errors='coerce')
+
+            df = df.dropna(subset=['% Change'])
+            adv = df.sort_values(by='% Change', ascending=False).head(5)
+            dec = df.sort_values(by='% Change', ascending=True).head(5)
+            return adv, dec
+
+        except Exception as e:
+            continue # Try next source if this one fails
+
+    st.error("Could not retrieve data from any source. NGX servers may be down.")
+    return None, None
+
+# --- 4. EXPORT LOGIC ---
 def create_excel(adv, dec, date_str):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        # Format the data for Excel
-        adv_final = adv[['Ticker', '% Change', 'Close Price', 'Naira Change']]
-        dec_final = dec[['Ticker', '% Change', 'Close Price', 'Naira Change']]
-        
-        adv_final.to_excel(writer, sheet_name='Summary', startrow=2, index=False)
-        dec_final.to_excel(writer, sheet_name='Summary', startrow=10, index=False)
-        
+        adv.to_excel(writer, sheet_name='Summary', startrow=2, index=False)
+        dec.to_excel(writer, sheet_name='Summary', startrow=10, index=False)
         ws = writer.sheets['Summary']
         bold = writer.book.add_format({'bold': True, 'align': 'center'})
         ws.merge_range('A1:D1', f"DAILY EQUITY SUMMARY FOR {date_str}", bold)
@@ -96,10 +106,9 @@ def create_word(adv, dec, date_str):
     doc.add_heading(f"DAILY EQUITY SUMMARY FOR {date_str}", 1).alignment = WD_ALIGN_PARAGRAPH.CENTER
     for df, label in [(adv, "Top 5 Advancers"), (dec, "Top 5 Decliners")]:
         doc.add_heading(label, 2)
-        table = doc.add_table(rows=1, cols=4)
-        table.style = 'Table Grid'
-        for i, h in enumerate([label, "% Change", "Close Price", "Naira Change"]):
-            table.rows[0].cells[i].text = h
+        table = doc.add_table(rows=1, cols=4); table.style = 'Table Grid'
+        hdrs = ["Ticker", "% Change", "Close Price", "Naira Change"]
+        for i, h in enumerate(hdrs): table.rows[0].cells[i].text = h
         for _, row in df.iterrows():
             c = table.add_row().cells
             c[0].text, c[1].text = str(row['Ticker']), f"{row['% Change']:.2f}%"
@@ -108,28 +117,24 @@ def create_word(adv, dec, date_str):
     doc.save(bio)
     return bio.getvalue()
 
-# --- 4. UI ---
+# --- 5. UI ---
 st.set_page_config(page_title="NGX Reporter", page_icon="🇳🇬")
-st.title("🇳🇬 NGX Market Reporter")
+st.title("🇳🇬 NGX Top 5 Advancers & Decliners")
 
 market_date = get_market_date()
-st.info(f"Report Date: **{market_date}**")
+st.info(f"Generating report for: **{market_date}**")
 
-if st.button("🚀 Fetch Latest Advancers & Decliners"):
-    with st.spinner("Fetching live data..."):
+if st.button("🚀 Fetch Latest Data"):
+    with st.spinner("Scanning market tables..."):
         adv, dec = fetch_ngx_data()
         
         if adv is not None and not adv.empty:
             st.success("Data loaded successfully!")
-            
-            col1, col2 = st.columns(2)
-            col1.download_button("📊 Download Excel", create_excel(adv, dec, market_date), f"NGX_Report_{market_date}.xlsx")
-            col2.download_button("📝 Download Word", create_word(adv, dec, market_date), f"NGX_Report_{market_date}.docx")
+            c1, c2 = st.columns(2)
+            c1.download_button("📊 Excel", create_excel(adv, dec, market_date), f"NGX_{market_date}.xlsx")
+            c2.download_button("📝 Word", create_word(adv, dec, market_date), f"NGX_{market_date}.docx")
             
             st.subheader("🟢 Top 5 Advancers")
-            st.dataframe(adv[['Ticker', '% Change', 'Close Price', 'Naira Change']], hide_index=True)
-            
+            st.dataframe(adv, hide_index=True)
             st.subheader("🔴 Top 5 Decliners")
-            st.dataframe(dec[['Ticker', '% Change', 'Close Price', 'Naira Change']], hide_index=True)
-        else:
-            st.error("Could not find market data. Please check your internet connection and try again.")
+            st.dataframe(dec, hide_index=True)
