@@ -6,6 +6,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium_stealth import stealth
 import io
 import time
 from docx import Document
@@ -31,81 +32,80 @@ def get_market_date():
 # --- STEALTH DRIVER SETUP ---
 def get_driver():
     options = Options()
-    options.add_argument("--headless=new") # Optimized headless mode
+    options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     
-    # --- FIREWALL BYPASS STEALTH SETTINGS ---
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    
+    # Standard paths for Streamlit Cloud
     options.binary_location = "/usr/bin/chromium"
     service = Service("/usr/bin/chromedriver")
     
-    return webdriver.Chrome(service=service, options=options)
+    driver = webdriver.Chrome(service=service, options=options)
+    
+    # Apply Stealth settings to bypass Sucuri Firewall
+    stealth(driver,
+        languages=["en-US", "en"],
+        vendor="Google Inc.",
+        platform="Win32",
+        webgl_vendor="Intel Inc.",
+        renderer="Intel Iris OpenGL Engine",
+        fix_hairline=True,
+    )
+    return driver
 
 def fetch_ngx_data():
     driver = None
     try:
         driver = get_driver()
-        # Remove the 'webdriver' flag so the site thinks we are human
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        })
+        # Navigate directly to the Price List page
+        driver.get("https://ngxgroup.com/exchange/data/equities-price-list/")
         
-        # 1. Visit the home page
-        driver.get("https://ngxgroup.com/")
+        wait = WebDriverWait(driver, 45) # Increased timeout
         
-        # 2. Wait and click the Price List tab
-        wait = WebDriverWait(driver, 30)
-        tab = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a[href='#tab2']")))
+        # Wait for the table to appear (searching for the wpDataTable class)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.wpDataTable")))
+        time.sleep(2) # Extra time for JS to populate rows
         
-        # Scroll to it and click
-        driver.execute_script("arguments[0].scrollIntoView();", tab)
-        time.sleep(1)
-        driver.execute_script("arguments[0].click();", tab)
-        
-        # 3. Wait for the table to actually populate with data
-        # We look for a table cell that contains data, not just the header
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#tab2 table.wpDataTable tbody tr td")))
-        
-        # 4. Extract data
+        # Extract data
         html_content = driver.page_source
         df_list = pd.read_html(io.StringIO(html_content))
         
-        # Find the correct table in the list
+        # Filter for the correct table
         df = None
         for table in df_list:
             if 'Symbol' in table.columns:
                 df = table
                 break
         
-        if df is None:
-            st.error("Table found but columns don't match. Website structure might have changed.")
+        if df is None or df.empty:
             return None, None
 
-        # Clean and filter
+        # Clean columns to match NGX website headers
         df = df.rename(columns={'Symbol': 'Ticker', 'Current': 'Close Price', 'Change': 'Naira Change'})
+        
+        # Process numeric columns
         for col in ['% Change', 'Close Price', 'Naira Change']:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '').str.replace(',', '').str.strip(), errors='coerce')
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '').str.replace(',', '').str.strip(), errors='coerce')
 
         df = df.dropna(subset=['% Change'])
+        
+        # Top 5 Advancers and Decliners
         adv = df.sort_values(by='% Change', ascending=False).head(5)
         dec = df.sort_values(by='% Change', ascending=True).head(5)
+        
         return adv, dec
 
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Scraping Error: {e}")
         return None, None
     finally:
         if driver:
             driver.quit()
 
-# --- FILE GENERATORS (Same as before) ---
+# --- EXPORT GENERATORS ---
 def create_excel(adv, dec, date_str):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -114,7 +114,8 @@ def create_excel(adv, dec, date_str):
         ws = writer.sheets['Summary']
         bold = writer.book.add_format({'bold': True, 'align': 'center'})
         ws.merge_range('A1:D1', f"DAILY EQUITY SUMMARY FOR {date_str}", bold)
-        ws.write('A2', 'TOP 5 ADVANCERS', bold); ws.write('A10', 'TOP 5 DECLINERS', bold)
+        ws.write('A2', 'TOP 5 ADVANCERS', bold)
+        ws.write('A10', 'TOP 5 DECLINERS', bold)
     return output.getvalue()
 
 def create_word(adv, dec, date_str):
@@ -123,7 +124,8 @@ def create_word(adv, dec, date_str):
     for df, label in [(adv, "Top 5 Advancers"), (dec, "Top 5 Decliners")]:
         doc.add_heading(label, 2)
         table = doc.add_table(rows=1, cols=4); table.style = 'Table Grid'
-        for i, h in enumerate([label, "% Change", "Close Price", "Naira Change"]):
+        headers = [label, "% Change", "Close Price", "Naira Change"]
+        for i, h in enumerate(headers):
             table.rows[0].cells[i].text = h
         for _, row in df.iterrows():
             c = table.add_row().cells
@@ -133,20 +135,22 @@ def create_word(adv, dec, date_str):
     doc.save(bio)
     return bio.getvalue()
 
-# --- UI ---
-st.set_page_config(page_title="NGX Reporter", page_icon="🇳🇬")
-st.title("🇳🇬 NGX Market Reporter")
-market_date = get_market_date()
-st.info(f"Market Date: **{market_date}**")
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="NGX Reporter")
+st.title("🇳🇬 NGX Market Report")
 
-if st.button("🚀 Run Report"):
-    with st.spinner("Accessing NGX website... (This takes about 20-30 seconds)"):
+market_date = get_market_date()
+st.info(f"Report for: **{market_date}**")
+
+if st.button("🚀 Fetch Data"):
+    with st.spinner("Bypassing firewall... Please wait."):
         adv, dec = fetch_ngx_data()
         if adv is not None:
-            st.success("Data Captured!")
+            st.success(f"Successfully captured data for {market_date}!")
             c1, c2 = st.columns(2)
-            c1.download_button("📊 Excel", create_excel(adv, dec, market_date), f"NGX_{market_date}.xlsx")
-            c2.download_button("📝 Word", create_word(adv, dec, market_date), f"NGX_{market_date}.docx")
+            c1.download_button("📊 Download Excel", create_excel(adv, dec, market_date), f"NGX_{market_date}.xlsx")
+            c2.download_button("📝 Download Word", create_word(adv, dec, market_date), f"NGX_{market_date}.docx")
+            
             st.subheader("Top 5 Advancers")
             st.table(adv[['Ticker', '% Change', 'Close Price', 'Naira Change']])
             st.subheader("Top 5 Decliners")
