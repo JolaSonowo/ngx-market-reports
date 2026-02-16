@@ -105,4 +105,33 @@ def create_word(adv, dec, date_str):
         table = doc.add_table(rows=1, cols=4); table.style = 'Table Grid'
         headers = ["Ticker", "% Change", "Close Price", "Naira Change"]
         for i, h in enumerate(headers): table.rows[0].cells[i].text = h
-        for
+        for _, row in df.iterrows():
+            c = table.add_row().cells
+            c[0].text, c[1].text = str(row['Ticker']), f"{row['% Change']:.2f}%"
+            c[2].text, c[3].text = f"{row['Close Price']:.2f}", f"{row['Naira Change']:.2f}"
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+# --- 4. UI ---
+st.set_page_config(page_title="NGX Reporter", page_icon="🇳🇬")
+st.title("🇳🇬 NGX Market Report")
+
+market_date = get_market_date()
+st.info(f"Report Date: **{market_date}**")
+
+if st.button("🚀 Fetch Top 5 Advancers & Decliners"):
+    with st.spinner("Fetching market data..."):
+        adv, dec = fetch_ngx_data()
+        if adv is not None and not adv.empty:
+            st.success("Data Captured!")
+            c1, c2 = st.columns(2)
+            c1.download_button("📊 Excel", create_excel(adv, dec, market_date), f"NGX_{market_date}.xlsx")
+            c2.download_button("📝 Word", create_word(adv, dec, market_date), f"NGX_{market_date}.docx")
+            
+            st.subheader("🟢 Top 5 Advancers")
+            st.table(adv[['Ticker', '% Change', 'Close Price', 'Naira Change']])
+            st.subheader("🔴 Top 5 Decliners")
+            st.table(dec[['Ticker', '% Change', 'Close Price', 'Naira Change']])
+        else:
+            st.warning("Could not find data. The market feed might be down for maintenance.")
