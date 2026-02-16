@@ -1,6 +1,7 @@
 streamlit
 pandas
 selenium
+selenium-stealth
 xlsxwriter
 python-docx
 lxml
