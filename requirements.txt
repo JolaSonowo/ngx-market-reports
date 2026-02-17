@@ -1,7 +1,6 @@
 streamlit
 pandas
 requests
-cloudscraper
 xlsxwriter
 python-docx
 lxml
