@@ -1,134 +1,97 @@
 import streamlit as st
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import cloudscraper
 import io
-import time
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time, timedelta
 import pytz
 
-# --- 1. DATE LOGIC (Lagos Time, 2:40 PM Cutoff) ---
-def get_market_date():
+# --- 1. SMART DATE LOGIC (Lagos Timezone) ---
+def get_report_info():
     lagos_tz = pytz.timezone('Africa/Lagos')
     now = datetime.now(lagos_tz)
     weekday = now.weekday()  # 0=Mon, 6=Sun
-    current_time = now.time()
-    cutoff_time = dt_time(14, 40) # 2:40 PM
-
-    if weekday == 5: # Saturday -> Show Friday
-        report_date = now - timedelta(days=1)
-    elif weekday == 6: # Sunday -> Show Friday
-        report_date = now - timedelta(days=2)
-    elif current_time < cutoff_time:
-        # Before 2:40 PM: Show previous trading day
-        # If Monday, go back to Friday (3 days)
-        report_date = now - timedelta(days=3 if weekday == 0 else 1)
+    cutoff_time = time(14, 40) # 2:40 PM
+    
+    # Logic:
+    # 1. Weekend -> Show Friday
+    # 2. Weekday before 2:40 PM -> Show Previous Trading Day
+    # 3. Weekday after 2:40 PM -> Show Today
+    
+    if weekday == 5: # Saturday
+        target_date = now - timedelta(days=1)
+    elif weekday == 6: # Sunday
+        target_date = now - timedelta(days=2)
+    elif now.time() < cutoff_time:
+        if weekday == 0: # Monday morning -> Friday
+            target_date = now - timedelta(days=3)
+        else:
+            target_date = now - timedelta(days=1)
     else:
-        # After 2:40 PM: Show today
-        report_date = now
+        target_date = now
         
-    return report_date.strftime("%d %B %Y").upper()
+    return target_date.strftime("%d %B %Y").upper()
 
-# --- 2. THE STEALTH BROWSER ---
-def get_driver():
-    options = Options()
-    options.add_argument("--headless=new") # New headless mode is harder to detect
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    
-    # Hiding Selenium from the Sucuri Firewall
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
-    
-    # Critical for Streamlit Cloud
-    options.binary_location = "/usr/bin/chromium"
-    service = Service("/usr/bin/chromedriver")
-    
-    driver = webdriver.Chrome(service=service, options=options)
-    
-    # Disable the 'webdriver' flag so the site doesn't know we are a bot
-    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    })
-    
-    return driver
-
-# --- 3. DATA SCRAPER ---
+# --- 2. DATA EXTRACTION (Firewall Bypass) ---
 def fetch_ngx_data():
-    driver = None
+    # Use cloudscraper to bypass Sucuri Firewall
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
+    
+    # We target the AJAX endpoint NGX uses to load the price table
+    # This is more reliable than scraping the visible HTML
+    url = "https://ngxgroup.com/wp-admin/admin-ajax.php?action=get_wdtable&table_id=2"
+    
     try:
-        driver = get_driver()
-        # Direct URL to the price list which is more stable
-        driver.get("https://ngxgroup.com/exchange/data/equities-price-list/")
-        
-        # Wait up to 30 seconds for the table to populate
-        wait = WebDriverWait(driver, 30)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.wpDataTable tbody tr td")))
-        
-        # Give it a moment to finish rendering numeric values
-        time.sleep(2)
-        
-        html_content = driver.page_source
-        df_list = pd.read_html(io.StringIO(html_content))
-        
-        # Look for the table with "Symbol" or "% Change"
-        df = None
-        for table in df_list:
-            if any('% Change' in str(col) for col in table.columns):
-                df = table
-                break
-        
-        if df is None:
-            st.error("Table structure not found. Site may be under maintenance.")
-            return None, None
+        response = scraper.get(url, timeout=15)
+        if response.status_code != 200:
+            # Fallback: Try the direct Price List page
+            response = scraper.get("https://afx.kwayisi.org/ngx/", timeout=15)
+            df = pd.read_html(io.StringIO(response.text))[0]
+            df = df.rename(columns={'Ticker': 'Ticker', 'Price': 'Close Price', 'Gain': '% Change', 'Change': 'Naira Change'})
+        else:
+            data = response.json()
+            df = pd.DataFrame(data['data'])
+            # Mapping API keys to readable names
+            df = df.rename(columns={
+                'symbol': 'Ticker',
+                'current': 'Close Price',
+                'pchange': '% Change',
+                'change': 'Naira Change'
+            })
 
-        # Clean column names (NGX sometimes adds extra spaces)
-        df.columns = [str(c).strip() for c in df.columns]
-        
-        # Standardize names
-        df = df.rename(columns={
-            'Symbol': 'Ticker',
-            'Current': 'Close Price',
-            'Change': 'Naira Change'
-        })
-
-        # Process numbers (Handle %, commas, and signs)
+        # Clean numeric columns
         for col in ['% Change', 'Close Price', 'Naira Change']:
             if col in df.columns:
                 df[col] = df[col].astype(str).str.replace('%', '').str.replace(',', '').str.replace('+', '').strip()
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Get Top 5 Advancers (Gainers) and Decliners (Losers)
-        df = df.dropna(subset=['% Change'])
+        df = df.dropna(subset=['Ticker', '% Change'])
+        
+        # Sort to get Top 5 Advancers and Decliners
         adv = df.sort_values(by='% Change', ascending=False).head(5)
         dec = df.sort_values(by='% Change', ascending=True).head(5)
         
         return adv, dec
 
     except Exception as e:
-        st.error(f"⚠️ Market Access Error: {e}")
+        st.error(f"Fetch Error: {e}")
         return None, None
-    finally:
-        if driver:
-            driver.quit()
 
-# --- 4. EXPORT FUNCTIONS ---
+# --- 3. FILE GENERATION ---
 def create_excel(adv, dec, date_str):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         adv[['Ticker', '% Change', 'Close Price', 'Naira Change']].to_excel(writer, sheet_name='Summary', startrow=2, index=False)
         dec[['Ticker', '% Change', 'Close Price', 'Naira Change']].to_excel(writer, sheet_name='Summary', startrow=10, index=False)
         ws = writer.sheets['Summary']
-        bold = writer.book.add_format({'bold': True, 'align': 'center'})
+        bold = writer.book.add_format({'bold': True, 'align': 'center', 'font_size': 12})
         ws.merge_range('A1:D1', f"DAILY EQUITY SUMMARY FOR {date_str}", bold)
         ws.write('A2', 'TOP 5 ADVANCERS', bold)
         ws.write('A10', 'TOP 5 DECLINERS', bold)
@@ -136,47 +99,53 @@ def create_excel(adv, dec, date_str):
 
 def create_word(adv, dec, date_str):
     doc = Document()
-    title = doc.add_heading(f"DAILY EQUITY SUMMARY FOR {date_str}", 1)
+    title = doc.add_heading(f"DAILY EQUITY SUMMARY FOR {date_str}", level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
     for df, label in [(adv, "Top 5 Advancers"), (dec, "Top 5 Decliners")]:
-        doc.add_heading(label, 2)
+        doc.add_heading(label, level=2)
         table = doc.add_table(rows=1, cols=4)
         table.style = 'Table Grid'
-        hdr = table.rows[0].cells
-        hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text = "Ticker", "% Change", "Close Price", "Naira Change"
+        headers = ["Ticker", "% Change", "Close Price", "Naira Change"]
+        for i, h in enumerate(headers):
+            table.rows[0].cells[i].text = h
         for _, row in df.iterrows():
-            c = table.add_row().cells
-            c[0].text, c[1].text = str(row['Ticker']), f"{row['% Change']:.2f}%"
-            c[2].text, c[3].text = f"{row['Close Price']:.2f}", f"{row['Naira Change']:.2f}"
+            cells = table.add_row().cells
+            cells[0].text = str(row['Ticker'])
+            cells[1].text = f"{row['% Change']:.2f}%"
+            cells[2].text = f"{row['Close Price']:.2f}"
+            cells[3].text = f"{row['Naira Change']:.2f}"
+            
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
 
-# --- 5. UI ---
-st.set_page_config(page_title="NGX Live Reporter", page_icon="🇳🇬")
+# --- 4. STREAMLIT UI ---
+st.set_page_config(page_title="NGX Smart Reporter", page_icon="🇳🇬")
 st.title("🇳🇬 NGX Market Reporter")
 
-market_date = get_market_date()
-st.subheader(f"📅 Market Date: {market_date}")
-st.caption("Auto-Logic: Weekends show Friday. Weekdays before 2:40 PM show previous day.")
+report_date = get_report_info()
+st.subheader(f"📅 Report Date: {report_date}")
+st.caption("Auto-Logic: Weekends show Friday. Weekdays before 2:40 PM show previous trading day.")
 
-if st.button("🚀 Fetch Top 5 Advancers & Decliners"):
-    with st.spinner("Opening Secure Browser to NGX..."):
+if st.button("🚀 Fetch Data & Generate Reports"):
+    with st.spinner("Connecting to NGX Secure Data Feed..."):
         adv, dec = fetch_ngx_data()
         
         if adv is not None and not adv.empty:
-            st.success("Data Captured!")
-            c1, c2 = st.columns(2)
-            c1.download_button("📊 Download Excel", create_excel(adv, dec, market_date), f"NGX_Summary_{market_date}.xlsx")
-            c2.download_button("📝 Download Word", create_word(adv, dec, market_date), f"NGX_Summary_{market_date}.docx")
+            st.success("Data Captured Successfully!")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button("📊 Excel Report", create_excel(adv, dec, report_date), f"NGX_Summary_{report_date}.xlsx")
+            with col2:
+                st.download_button("📝 Word Report", create_word(adv, dec, report_date), f"NGX_Summary_{report_date}.docx")
             
             st.markdown("---")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.write("### 🟢 Top 5 Advancers")
-                st.table(adv[['Ticker', '% Change', 'Close Price']])
-            with col_b:
-                st.write("### 🔴 Top 5 Decliners")
-                st.table(dec[['Ticker', '% Change', 'Close Price']])
+            st.write("### 🟢 Top 5 Advancers")
+            st.table(adv[['Ticker', '% Change', 'Close Price']])
+            
+            st.write("### 🔴 Top 5 Decliners")
+            st.table(dec[['Ticker', '% Change', 'Close Price']])
         else:
-            st.warning("The NGX website is currently blocking the connection. Please wait 1 minute and click again to retry.")
+            st.warning("Could not retrieve data. The NGX servers may be under high load or blocking requests. Please try again in 30 seconds.")
