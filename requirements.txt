@@ -1,5 +1,0 @@
-streamlit
-selenium
-pandas
-openpyxl
-python-docx
