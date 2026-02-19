@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; padding: 30px; }
+        .container { max-width: 1000px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
+        .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        #clock { font-size: 24px; font-weight: bold; color: #4a7ebb; background: #eef3f9; padding: 10px 20px; border-radius: 8px; border: 1px solid #4a7ebb; }
+        .banner { background: #4a7ebb; color: white; text-align: center; padding: 20px; border-radius: 8px; font-size: 22px; width: 100%; margin-bottom: 20px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th { color: white; padding: 12px; text-align: left; font-size: 13px; }
+        .gh { background: #3e7d44; } .lh { background: #d64541; }
+        td { padding: 10px; border-bottom: 1px solid #eee; }
+        .btn-row { text-align: center; margin-top: 30px; }
+        .btn { padding: 12px 20px; border: none; border-radius: 5px; color: white; text-decoration: none; font-weight: bold; margin: 5px; display: inline-block; cursor: pointer; }
+    </style>
+</head>
+<body onload="updateClock()">
+    <div class="container">
+        <div class="top-bar">
+            <div style="font-weight: bold; color: #555;">MARKET MONITOR</div>
+            <div id="clock">00:00:00</div>
+        </div>
+        <div class="banner">DAILY EQUITY SUMMARY FOR {{ date }}</div>
+        <div class="grid">
+            <div>
+                <h3>Top 5 Gainers</h3>
+                <table>
+                    <tr class="gh"><th>Symbol</th><th>Close</th><th>% Chg</th><th>Naira</th></tr>
+                    {% for s in gainers %}
+                    <tr><td style="color:#3e7d44; font-weight:bold;">{{s.symbol}}</td><td>{{s.close}}</td><td>{{s.pc_chg}}</td><td>{{s.n_chg}}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+            <div>
+                <h3>Top 5 Losers</h3>
+                <table>
+                    <tr class="lh"><th>Symbol</th><th>Close</th><th>% Chg</th><th>Naira</th></tr>
+                    {% for s in losers %}
+                    <tr><td>{{s.symbol}}</td><td>{{s.close}}</td><td style="color:red">{{s.pc_chg}}</td><td style="color:red">{{s.n_chg}}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+        </div>
+        <div class="btn-row">
+            <a href="/download/word" class="btn" style="background:#82b541">GENERATE WORD DOC</a>
+            <a href="/download/excel" class="btn" style="background:#4a7ebb">GENERATE EXCEL</a>
+        </div>
+    </div>
+
+    <script>
+        function updateClock() {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('en-GB', { hour12: false });
+            document.getElementById('clock').innerText = timeStr + " WAT";
+            setTimeout(updateClock, 1000);
+        }
+    </script>
+</body>
+</html>
