@@ -1,7 +1,5 @@
 streamlit
+selenium
 pandas
-requests
-xlsxwriter
+openpyxl
 python-docx
-lxml
-pytz
