@@ -1,24 +1,34 @@
-import streamlit as st
-from scraper import scrape_equities_table, get_top_movers, generate_excel, generate_word
-import os
+from flask import Flask, send_file, render_template_string, request
+from io import BytesIO
+from ngx_report import generate_files_for_today
 
-st.set_page_config(page_title="NGX Market Reporter", layout="wide")
-st.title("🇳🇬 NGX Market Reporter")
-st.write("Click the button below to fetch the latest market data and generate reports.")
+app = Flask(__name__)
 
-if st.button("Generate Latest Market Report"):
-    with st.spinner("Fetching NGX data..."):
-        df = scrape_equities_table()
-        gainers, decliners = get_top_movers(df)
-        excel_path = generate_excel(gainers, decliners)
-        word_path = generate_word(gainers, decliners)
+HTML = """
+<!doctype html>
+<title>NGX Daily Equity Summary</title>
+<h1>NGX Daily Equity Summary</h1>
+<form method="post" action="/generate">
+  <button type="submit">Generate Today’s Report</button>
+</form>
+"""
 
-    st.success("Reports Generated!")
+@app.get("/")
+def home():
+    return render_template_string(HTML)
 
-    with open(excel_path, "rb") as f:
-        st.download_button("Download Excel", f, file_name="NGX_Market_Report.xlsx")
+@app.post("/generate")
+def generate():
+    xlsx, docx, basename = generate_files_for_today()
 
-    with open(word_path, "rb") as f:
-        st.download_button("Download Word", f, file_name="NGX_Market_Report.docx")
+    # Simple approach: return the Excel, and you can add a second button for Word
+    # Better: zip both and download one file. For now, choose based on a query param.
+    kind = request.args.get("kind", "xlsx")
+    if kind == "docx":
+        return send_file(BytesIO(docx), as_attachment=True, download_name=f"{basename}.docx",
+                         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    return send_file(BytesIO(xlsx), as_attachment=True, download_name=f"{basename}.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.write("Reports are generated in the `reports/` folder on the server.")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
